@@ -10,6 +10,14 @@ extern "C" {
 #define JSD_PO2OP_MAX_ATTEMPTS 3
 #define JSD_ELIST_MAX_READS 20
 
+// During the SAFE_OP -> OP transition, process data is streamed at the control
+// cycle rate. DC-synchronous slaves (e.g. EL1259) need sustained cyclic frames
+// to lock their SYNC0 PLL before they will enter OP (a quiet bus raises AL
+// status 0x0032 "PLL error"). JSD_DC_PLL_WARMUP_US is how long to stream in
+// SAFE_OP to lock the PLL first; JSD_PO2OP_TIMEOUT_US bounds the total wait.
+#define JSD_DC_PLL_WARMUP_US 2000000  ///< DC SYNC0 PLL warm-up window (us)
+#define JSD_PO2OP_TIMEOUT_US 5000000  ///< max wall-clock wait for OP (us)
+
 /**
  * @brief converts ec_state int to human-readable string
  *

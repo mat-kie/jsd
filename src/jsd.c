@@ -153,6 +153,57 @@ bool jsd_init(jsd_t* self, const char* ifname, uint8_t enable_autorecovery, int 
   // Auto-configure Distributed Clock capable slaves
   ecx_configdc(&self->ecx_context);
 
+  // Activate DC SYNC0 on slaves that require it. Some terminals (e.g. EL1259)
+  // declare ONLY a DC-Synchron OpMode in their ESI and refuse the PreOp->SafeOp
+  // transition until SYNC0 is running. ecx_config_overlap_map_group() above
+  // already requested SAFE_OP *before* DC was set up, so any such slave is now
+  // latched in PRE-OP + ERROR (state 0x12). The recovery sequence is therefore:
+  //   1) enable SYNC0 (ecx_configdc must run first, as it does above),
+  //   2) acknowledge the AL error (write target_state | EC_STATE_ACK), then
+  //   3) re-request SAFE_OP and wait for it,
+  // before the OP transition below can succeed.
+  bool any_dc_sync0 = false;
+  for (sid = 1; sid <= *self->ecx_context.slavecount; sid++) {
+    jsd_slave_config_t* config = &self->slave_configs[sid];
+    if (!config->configuration_active || !config->dc_sync0_enable) {
+      continue;
+    }
+    any_dc_sync0 = true;
+    MSG("Activating DC SYNC0 on slave %d: cycle=%u ns, shift=%d ns", sid,
+        config->dc_sync0_cycle_ns, config->dc_sync0_shift_ns);
+    ecx_dcsync0(&self->ecx_context, (uint16_t)sid, TRUE,
+                config->dc_sync0_cycle_ns, config->dc_sync0_shift_ns);
+  }
+
+  if (any_dc_sync0) {
+    // Refresh per-slave AL status so we can detect the PRE-OP + ERROR latch.
+    ecx_readstate(&self->ecx_context);
+    for (sid = 1; sid <= *self->ecx_context.slavecount; sid++) {
+      jsd_slave_config_t* config = &self->slave_configs[sid];
+      if (!config->configuration_active || !config->dc_sync0_enable) {
+        continue;
+      }
+      // EC_STATE_ERROR == EC_STATE_ACK == 0x10
+      if (self->ecx_context.slavelist[sid].state & EC_STATE_ERROR) {
+        WARNING(
+            "slave[%d] latched AL error 0x%04x (%s) before SYNC0; "
+            "acknowledging and re-requesting SAFE_OP",
+            sid, self->ecx_context.slavelist[sid].ALstatuscode,
+            ec_ALstatuscode2string(
+                self->ecx_context.slavelist[sid].ALstatuscode));
+        // Acknowledge the error: write SAFE_OP with the ACK/error bit set.
+        self->ecx_context.slavelist[sid].state =
+            EC_STATE_SAFE_OP | EC_STATE_ACK;
+        ecx_writestate(&self->ecx_context, (uint16_t)sid);
+        // Re-request a clean SAFE_OP now that SYNC0 is active.
+        self->ecx_context.slavelist[sid].state = EC_STATE_SAFE_OP;
+        ecx_writestate(&self->ecx_context, (uint16_t)sid);
+      }
+    }
+    // Wait for all slaves to settle into SAFE_OP before the OP transition.
+    ecx_statecheck(&self->ecx_context, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
+  }
+
   // Read individual slave state and store in self->ecx_context.slavelist[]
   ecx_readstate(&self->ecx_context);
 
@@ -165,71 +216,74 @@ bool jsd_init(jsd_t* self, const char* ifname, uint8_t enable_autorecovery, int 
 
   MSG_DEBUG("Attempting to put the bus in Operational state");
 
-  MSG_DEBUG("Performing first PDO exchange, required before transition to OP");
+  // One control cycle. timeout_us carries the loop period (the manager passes
+  // 1e6 / target_loop_rate_hz), which is also the DC SYNC0 cycle time.
+  long            cycle_ns    = (long)timeout_us * 1000L;
+  struct timespec cycle_sleep = {
+      .tv_sec  = (time_t)(cycle_ns / 1000000000L),
+      .tv_nsec = (long)(cycle_ns % 1000000000L),
+  };
+  int warmup_cycles =
+      (timeout_us > 0) ? (int)(JSD_DC_PLL_WARMUP_US / timeout_us) : 0;
+  int max_cycles = (timeout_us > 0) ? (int)(JSD_PO2OP_TIMEOUT_US / timeout_us)
+                                    : JSD_PO2OP_MAX_ATTEMPTS;
+  if (max_cycles < 1) {
+    max_cycles = 1;
+  }
 
-  self->ecx_context.slavelist[0].state = EC_STATE_OPERATIONAL;
-
-  struct timespec start_processdata_time;
-  clock_gettime(CLOCK_REALTIME, &start_processdata_time);
-  ecx_send_overlap_processdata(&self->ecx_context);
-  ecx_receive_processdata(&self->ecx_context, timeout_us);
-
-  ecx_writestate(&self->ecx_context, 0);
-
-  int attempt = 0;
-  while (true) {
-    struct timespec current_time;
-    clock_gettime(CLOCK_REALTIME, &current_time);
-    if ((current_time.tv_nsec - start_processdata_time.tv_nsec)/1e3 > timeout_us) {
-      MSG_DEBUG("Went over the loop period!");
-    }
-    else {
-      struct timespec diff;
-      diff.tv_sec = current_time.tv_sec - start_processdata_time.tv_sec;
-      diff.tv_nsec = current_time.tv_nsec - start_processdata_time.tv_nsec;
-      
-      // Sleep for period defined by timeout_us before attempting to do a receive_processdata.
-      // LRW packets must be sent at constant interval to encourage a successful transition to OP state/
-      if (nanosleep(&diff, NULL) < 0) {
-        perror("nanosleep failed");
-        return 1;
-      }
-    }
-    
-    clock_gettime(CLOCK_REALTIME, &start_processdata_time);
-    int sent = ecx_send_overlap_processdata(&self->ecx_context);
-    int wkc  = ecx_receive_processdata(&self->ecx_context, timeout_us);
-    ec_state actual_state = ecx_statecheck(
-        &self->ecx_context, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
-
-    attempt++;
-
-    MSG_DEBUG("sent: %d", sent);
-    MSG_DEBUG("Actual WKC: %d, Expected WKC: %d", wkc, self->expected_wkc);
-
-    if (actual_state != EC_STATE_OPERATIONAL) {
-      WARNING("Did not reach %s, actual state is %s",
-              jsd_ec_state_to_string(EC_STATE_OPERATIONAL),
-              jsd_ec_state_to_string(actual_state));
-      if (sent <= 0) {
-        WARNING("Process data could not be transmitted properly.");
-      }
-      if (wkc != self->expected_wkc) {
-        WARNING("Process data was not received properly.");
-      }
-      WARNING("Failed OP transition attempt %d of %d", attempt,
-              JSD_PO2OP_MAX_ATTEMPTS);
-
-      jsd_inspect_context(self);
-
-      if (attempt >= JSD_PO2OP_MAX_ATTEMPTS) {
-        ERROR("Max number of attempts to transition to OPERATIONAL exceeded.");
-        return false;
-      }
-    } else {  // good to go
-      break;
+  // DC-synchronous slaves (e.g. EL1259) only lock their SYNC0 PLL when process
+  // data keeps arriving at the cycle rate; a quiet bus raises AL 0x0032 "PLL
+  // error" and blocks the SAFE_OP -> OP transition. So, when any slave runs DC,
+  // first stream process data in SAFE_OP to lock the PLL before requesting OP.
+  // (Skipped for non-DC buses to keep their startup fast.)
+  if (any_dc_sync0) {
+    MSG_DEBUG("Streaming %d process-data cycles to lock DC SYNC0 PLL",
+              warmup_cycles);
+    for (int warmup = 0; warmup < warmup_cycles; ++warmup) {
+      nanosleep(&cycle_sleep, NULL);
+      ecx_send_overlap_processdata(&self->ecx_context);
+      ecx_receive_processdata(&self->ecx_context, timeout_us);
     }
   }
+
+  // Request OP, then keep the bus fed at the cycle rate while polling the state
+  // (timeout 0 == a single read) until OP is reached or we time out.
+  self->ecx_context.slavelist[0].state = EC_STATE_OPERATIONAL;
+  ecx_send_overlap_processdata(&self->ecx_context);
+  ecx_receive_processdata(&self->ecx_context, timeout_us);
+  ecx_writestate(&self->ecx_context, 0);
+
+  ec_state actual_state = EC_STATE_NONE;
+  int      cycle        = 0;
+  int      wkc          = 0;
+  for (cycle = 0; cycle < max_cycles; ++cycle) {
+    nanosleep(&cycle_sleep, NULL);
+    int sent = ecx_send_overlap_processdata(&self->ecx_context);
+    wkc      = ecx_receive_processdata(&self->ecx_context, timeout_us);
+    actual_state =
+        ecx_statecheck(&self->ecx_context, 0, EC_STATE_OPERATIONAL, 0);
+    if (actual_state == EC_STATE_OPERATIONAL) {
+      break;
+    }
+    if (sent <= 0) {
+      WARNING("Process data could not be transmitted properly.");
+    }
+  }
+
+  if (actual_state != EC_STATE_OPERATIONAL) {
+    WARNING(
+        "Did not reach %s after %d cycles (~%.1f s); last WKC %d of %d, actual "
+        "bus state is %s",
+        jsd_ec_state_to_string(EC_STATE_OPERATIONAL), cycle,
+        (double)cycle * (double)timeout_us / 1e6, wkc, self->expected_wkc,
+        jsd_ec_state_to_string(actual_state));
+    jsd_inspect_context(self);
+    ERROR("Failed to transition to OPERATIONAL.");
+    return false;
+  }
+
+  MSG_DEBUG("Reached OPERATIONAL after %d cycles; WKC %d of %d", cycle, wkc,
+            self->expected_wkc);
 
   // Initialize the error queues used between threads
   for (sid = 1; sid <= *self->ecx_context.slavecount; sid++) {
@@ -264,13 +318,20 @@ bool jsd_all_slaves_operational(jsd_t* self) {
     ecx_statecheck(&self->ecx_context, slave, EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
     if (self->ecx_context.slavelist[slave].state != EC_STATE_OPERATIONAL) {
       all_slaves_operational = false;
+      // ecx_statecheck above refreshes ALstatuscode; surface it so the actual
+      // AL fault (e.g. 0x0030 "Invalid DC SYNC Configuration") is visible.
+      uint16_t    al    = self->ecx_context.slavelist[slave].ALstatuscode;
+      const char* alstr = ec_ALstatuscode2string(al);
       if (self->ecx_context.slavelist[slave].state ==
           (EC_STATE_SAFE_OP + EC_STATE_ERROR)) {
-        ERROR("slave[%d] is in SAFE_OP + ERROR.", slave);
+        ERROR("slave[%d] is in SAFE_OP + ERROR (ALstatuscode 0x%04x: %s).",
+              slave, al, alstr);
       } else if (self->ecx_context.slavelist[slave].state == EC_STATE_SAFE_OP) {
-        ERROR("slave[%d] is in SAFE_OP.", slave);
+        ERROR("slave[%d] is in SAFE_OP (ALstatuscode 0x%04x: %s).", slave, al,
+              alstr);
       } else if (self->ecx_context.slavelist[slave].state > EC_STATE_NONE) {
-        ERROR("slave[%d] is in state with hexadecimal: %x", slave, self->ecx_context.slavelist[slave].state);
+        ERROR("slave[%d] is in state with hexadecimal: %x (ALstatuscode 0x%04x: %s).",
+              slave, self->ecx_context.slavelist[slave].state, al, alstr);
       } else {
         ERROR("slave[%d] is lost", slave);
       }

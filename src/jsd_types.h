@@ -64,6 +64,17 @@ typedef struct {
   bool     configuration_active;
   jsd_driver_type_t driver_type;
   char     name[JSD_NAME_LEN];
+
+  // Distributed Clock (DC) SYNC0 configuration. Kept generic (outside the
+  // per-device union) so jsd_init() can activate SYNC0 uniformly without
+  // switching on driver_type. Required for terminals whose ESI declares only a
+  // DC-Synchron OpMode (e.g. EL1259), which refuse the PreOp->SafeOp transition
+  // unless SYNC0 is active. Zero-initialized configs leave dc_sync0_enable
+  // false, so non-DC devices are unaffected.
+  bool     dc_sync0_enable;     ///< true => call ecx_dcsync0(act=TRUE) for this slave
+  uint32_t dc_sync0_cycle_ns;   ///< SYNC0 cycle time in ns (typically the control-loop period)
+  int32_t  dc_sync0_shift_ns;   ///< SYNC0 shift time in ns (ESI default for EL1259 is 0)
+
   union {
     jsd_el1008_config_t  el1008;
     jsd_el1259_config_t  el1259;

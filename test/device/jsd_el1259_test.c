@@ -109,6 +109,12 @@ int main(int argc, char* argv[]) {
   my_config.configuration_active = true;
   my_config.driver_type          = JSD_DRIVER_TYPE_EL1259;
 
+  // EL1259 requires DC SYNC0 active to reach SAFE_OP/OP. Derive the SYNC0 cycle
+  // from the test loop frequency (cycle_ns = 1e9 / loop_freq_hz).
+  my_config.dc_sync0_enable   = true;
+  my_config.dc_sync0_cycle_ns = (uint32_t)(1.0e9 / (double)loop_freq_hz);
+  my_config.dc_sync0_shift_ns = 0;
+
   jsd_set_slave_config(sds.jsd, slave_id, my_config);
 
   sds_run(&sds, ifname, "/tmp/jsd_el1259.csv");
