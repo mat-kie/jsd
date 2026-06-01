@@ -12,6 +12,7 @@ extern "C" {
 #include "jsd/jsd_ati_fts_types.h"
 #include "jsd/jsd_egd_types.h"
 #include "jsd/jsd_el1008_types.h"
+#include "jsd/jsd_el1259_types.h"
 #include "jsd/jsd_el2124_types.h"
 #include "jsd/jsd_el2809_types.h"
 #include "jsd/jsd_el2798_types.h"
@@ -37,6 +38,7 @@ typedef enum {
   JSD_DRIVER_TYPE_ATI_FTS = 0,
   JSD_DRIVER_TYPE_EGD,
   JSD_DRIVER_TYPE_EL1008,
+  JSD_DRIVER_TYPE_EL1259,
   JSD_DRIVER_TYPE_EL2124,
   JSD_DRIVER_TYPE_EL2809,
   JSD_DRIVER_TYPE_EL2798,
@@ -64,6 +66,7 @@ typedef struct {
   char     name[JSD_NAME_LEN];
   union {
     jsd_el1008_config_t  el1008;
+    jsd_el1259_config_t  el1259;
     jsd_el3602_config_t  el3602;
     jsd_el3208_config_t  el3208;
     jsd_el2124_config_t  el2124;
@@ -93,6 +96,7 @@ typedef struct {
 typedef struct {
   union {
     jsd_el1008_state_t      el1008;
+    jsd_el1259_state_t      el1259;
     jsd_el3602_state_t      el3602;
     jsd_el3208_state_t      el3208;
     jsd_el2124_state_t      el2124;

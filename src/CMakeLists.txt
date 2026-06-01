@@ -15,6 +15,7 @@ add_library(jsd-lib STATIC
     jsd_ati_fts.c
 
     jsd_el1008.c
+    jsd_el1259.c
     jsd_el2124.c
     jsd_el2798.c
     jsd_el2809.c
